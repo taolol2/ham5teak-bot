@@ -1,0 +1,13 @@
+{
+  "name": "ham5teak-raid-bot",
+  "version": "1.0.0",
+  "main": "bot.js",
+  "scripts": { "start": "node bot.js" },
+  "dependencies": {
+    "discord.js": "latest",
+    "dotenv": "latest",
+    "mineflayer": "latest",
+    "mineflayer-pathfinder": "latest",
+    "vec3": "latest"
+  }
+}

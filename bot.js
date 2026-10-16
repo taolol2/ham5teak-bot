@@ -19,10 +19,24 @@ const VERSIONS = process.env.MC_VERSION
 const RAID_MINUTES = Number(process.env.RAID_MINUTES || 10);
 const CHEST_SEARCH_DISTANCE = 64;
 const HOPPER_POS = { x: -5756, y: 63, z: -5259 };
+const FARM_CENTER = { x: -5757, z: -5257 }; // Proximity center
 
-// Keep list includes Emeralds, Ominous bottles, and Totems
-const keep = (it) =>
-  it.name === 'emerald' || it.name === 'emerald_block' || it.name.includes('ominous') || it.name.includes('totem');
+// Only keep Ominous bottles in inventory/chest processing
+const isOminousBottle = (it) => it && it.name.includes('ominous');
+
+// 100 Random Chat Phrases for Natural Anti-AFK Pacing
+const RANDOM_CHAT_PHRASES = [
+  "lol", "anyone selling keys?", "lag", "oof", "damn", "gg", "wow", "bruh", "true", "wait",
+  "anyone got food?", "so true", "yikes", "rip", "lets go", "oh", "nope", "yep", "nice", "ok",
+  "hm", "why", "idk", "bro", "help", "afk", "back", "reloading", "fast", "slow",
+  "anyone online?", "base", "home", "shop", "sell", "buy", "trade", "money", "rich", "poor",
+  "ggs", "ez", "cmon", "task", "work", "grind", "farm", "mob", "raid", "spawn",
+  "warp", "tp", "home sweet home", "lagging", "ping", "fps", "smooth", "hard", "easy", "cool",
+  "nice armor", "nice sword", "epic", "legend", "vortex", "h5u", "geforce", "team", "party", "koth",
+  "event", "vote", "keys", "crate", "open", "win", "lose", "dead", "alive", "heal",
+  "food", "potion", "bottle", "omni", "bad", "good", "best", "worst", "clean", "dirty",
+  "time", "day", "night", "sun", "rain", "storm", "mining", "builder", "miner", "player"
+];
 
 // ---------------- KEEP-ALIVE WEB SERVER ----------------
 http
@@ -77,6 +91,7 @@ function startBot() {
     hideErrors: false,
   });
   bot.loadPlugin(pathfinder);
+  bot.setMaxListeners(50);
 
   let started = false;
   let acceptAuthGui = USE_GUI_LOGIN;
@@ -87,12 +102,12 @@ function startBot() {
   let guiTries = 0;
   let gotAnyChat = false;
   let ended = false;
+  let onSurvivalServer = false;
 
-  // State & Memory Tracking for Excellent Recovery
   let manualStopWork = false;
   let isProximityPaused = false;
   let stopHeadTracking = false;
-  let currentTaskState = 'STARTUP'; // Remembers exact workflow step
+  let currentTaskState = 'STARTUP';
 
   const say = (m) => {
     try { bot.chat(m); } catch (e) { console.log('chat failed:', e.message); }
@@ -103,7 +118,6 @@ function startBot() {
     if (!stillMe() || ended) throw new Error('old-bot');
     if (abort) throw new Error('aborted');
     
-    // Pause loop execution if manual stop or proximity interruption is active
     while ((manualStopWork || isProximityPaused) && stillMe() && !ended && !abort) {
       await sleep(500);
     }
@@ -111,12 +125,35 @@ function startBot() {
     if (abort) throw new Error('aborted');
   };
 
-  // ---------- LOGIN GUI ----------
+  async function humanLookAt(targetVec, forceStep = false) {
+    if (!bot.entity) return;
+    try {
+      const startYaw = bot.entity.yaw;
+      const startPitch = bot.entity.pitch;
+      
+      bot.lookAt(targetVec, true);
+      const endYaw = bot.entity.yaw;
+      const endPitch = bot.entity.pitch;
+      bot.look(startYaw, startPitch, true);
+      
+      const steps = forceStep ? 1 : Math.floor(Math.random() * 4) + 6;
+      for (let i = 1; i <= steps; i++) {
+        if (!stillMe() || ended) break;
+        const ratio = i / steps;
+        const eased = ratio * (2 - ratio);
+        const currYaw = startYaw + (endYaw - startYaw) * eased + (Math.random() - 0.5) * 0.02;
+        const currPitch = startPitch + (endPitch - startPitch) * eased + (Math.random() - 0.5) * 0.02;
+        bot.look(currYaw, currPitch, true);
+        await sleep(25 + Math.floor(Math.random() * 20));
+      }
+    } catch (e) {}
+  }
+
   bot.on('windowOpen', async (win) => {
     if (!acceptAuthGui) return;
     guiTries++;
     if (guiTries > 6) return;
-    await sleep(1200);
+    await sleep(1200 + Math.floor(Math.random() * 400));
     try {
       if (String(win.type).includes('anvil')) {
         if (!AUTH_PASSWORD) return;
@@ -133,7 +170,9 @@ function startBot() {
   });
 
   function setupMovements() {
-    bot.pathfinder.setMovements(new Movements(bot));
+    const movements = new Movements(bot);
+    movements.canDig = false;
+    bot.pathfinder.setMovements(movements);
   }
 
   async function openNearestChest() {
@@ -164,7 +203,7 @@ function startBot() {
       sendDiscordAlert('⚠️ RockyRidge has no MC_PASSWORD set.');
       throw new Error('login failed');
     }
-    await wait(4000);
+    await wait(4000 + Math.floor(Math.random() * 1000));
 
     if (USE_GUI_LOGIN) {
       await wait(10000);
@@ -192,37 +231,63 @@ function startBot() {
     currentTaskState = 'STARTUP';
     await doLogin();
     reconnectDelay = 15000;
-    await wait(5000);
+    await wait(5000 + Math.floor(Math.random() * 2000));
     say('/server survival');
     await wait(20000);
+    onSurvivalServer = true;
   }
 
-  async function takePotionFromChest() {
+  // Obtain ominous potion: Checks inventory first; if missing, pulls from chest
+  async function obtainOminousPotion() {
     currentTaskState = 'TAKING_POTION';
-    const chest = await openNearestChest();
+    const existingPotion = bot.inventory.items().find(isOminousBottle);
+    if (existingPotion) return;
+
+    let chest = await openNearestChest();
     try {
-      await sleep(800);
-      const potion = chest.containerItems().find((i) => i.name.includes('ominous'));
-      if (!potion) throw new Error('No ominous potion in chest');
-      await chest.withdraw(potion.type, null, 1);
+      await sleep(800 + Math.floor(Math.random() * 300));
+      let potion = chest.containerItems().find(isOminousBottle);
+      
+      while (!potion && stillMe() && !ended && !abort) {
+        console.log('[POTION] Out of ominous potions in chest. Waiting for restock...');
+        chest.close();
+        await sleep(15000);
+        const reOpenedChest = await openNearestChest();
+        potion = reOpenedChest.containerItems().find(isOminousBottle);
+        if (potion) {
+          await reOpenedChest.withdraw(potion.type, null, 1);
+          reOpenedChest.close();
+          return;
+        }
+        chest = reOpenedChest;
+      }
+      
+      if (potion) {
+        await chest.withdraw(potion.type, null, 1);
+      }
     } finally {
-      chest.close();
+      try { chest.close(); } catch (e) {}
     }
   }
 
   async function drinkPotion() {
     currentTaskState = 'DRINKING_POTION';
-    const potion = bot.inventory.items().find((i) => i.name.includes('ominous'));
+    const potion = bot.inventory.items().find(isOminousBottle);
     if (!potion) throw new Error('No ominous potion in inventory');
     await bot.equip(potion, 'hand');
-    await bot.consume();
+    
+    bot.activateItem();
+    await sleep(2000 + Math.floor(Math.random() * 200));
+    bot.deactivateItem();
+    
     bot.setQuickBarSlot(0);
   }
 
   async function attackLoop(ms) {
     currentTaskState = 'ATTACKING_RAID';
-    console.log(`Attacking armor stand while crouching at raid farm for ${ms / 60000} minutes...`);
+    console.log(`Executing randomized anti-detection attack loop for ${ms / 60000} minutes...`);
     const end = Date.now() + ms;
+    
     while (Date.now() < end) {
       if (manualStopWork || isProximityPaused) {
         bot.setControlState('sneak', false);
@@ -232,93 +297,124 @@ function startBot() {
         if (!stillMe() || ended) throw new Error('old-bot');
         if (abort) throw new Error('aborted');
       }
-      bot.setControlState('sneak', true); // Keep crouching
+      
+      bot.setControlState('sneak', true);
+      
       const stand = bot.nearestEntity(
         (e) => e.name === 'armor_stand' && e.position.distanceTo(bot.entity.position) < 4
       );
+      
       if (stand) {
-        await bot.lookAt(stand.position.offset(0, 1, 0), true);
+        await humanLookAt(stand.position.offset(0, 0.9 + Math.random() * 0.2, 0));
         bot.attack(stand);
       } else {
         bot.swingArm('right');
       }
-      await wait(1000);
+      
+      const randomInterval = 950 + Math.floor(Math.random() * 400);
+      await wait(randomInterval);
     }
     bot.setControlState('sneak', false);
   }
 
+  // ---------- COMPREHENSIVE CLEANUP & PAY PROTOCOL ----------
+// ---------- COMPREHENSIVE CLEANUP & PAY PROTOCOL ----------
   async function cleanup() {
     currentTaskState = 'CLEANUP';
-    const chest = await openNearestChest();
+    
+    let chest = await openNearestChest();
     try {
       await sleep(800);
       const all = chest.containerItems();
-      const isFull = all.length >= chest.inventoryStart && all.every(keep);
-      if (isFull) sendDiscordAlert('⚠️ Farm chest is full!');
+      
+      // Check if the chest is ACTUALLY FULL (all slots occupied) and every single slot is an ominous bottle
+      const chestIsFull = all.length >= chest.inventoryStart;
+      const onlyBottles = all.every(isOminousBottle);
+
+      if (chestIsFull && onlyBottles) {
+        sendDiscordAlert('⚠️ Farm chest is full ONLY with ominous bottles! Bot is idling.');
+        chest.close();
+        while (stillMe() && !ended && !abort) {
+          await sleep(30000);
+        }
+        return;
+      }
+
       for (const it of all) {
-        if (keep(it)) continue;
-        try { await chest.withdraw(it.type, null, it.count); } catch (e) { break; }
-        await sleep(250);
+        if (isOminousBottle(it)) continue; // Never touch ominous bottles
+        try {
+          await chest.withdraw(it.type, null, it.count);
+        } catch (e) {
+          break;
+        }
+        await sleep(350 + Math.floor(Math.random() * 150));
       }
     } finally {
-      chest.close();
+      try { chest.close(); } catch (e) {}
     }
 
+    // Sell ALL inventory items using /sellgui (except ominous bottles)
     say('/sellgui');
     const win = await waitForWindow(6000);
     if (win) {
-      await sleep(800);
+      await sleep(900);
       const hotbar0 = win.inventoryStart + 27;
       const mine = win.slots.filter(
         (it) => it && it.slot >= win.inventoryStart && it.slot < win.inventoryEnd
       );
       for (const it of mine) {
-        if (it.slot === hotbar0 || keep(it)) continue;
+        if (it.slot === hotbar0 || isOminousBottle(it)) continue;
         try { await bot.clickWindow(it.slot, 0, 1); } catch (e) {}
-        await sleep(200);
+        await sleep(250 + Math.floor(Math.random() * 100));
       }
       await sleep(500);
       bot.closeWindow(win);
     }
     await sleep(1000);
 
-    const leftovers = () => bot.inventory.items().filter((it) => !keep(it) && it.slot !== 36);
-    if (leftovers().length === 0) return;
-
-    setupMovements();
-    await bot.pathfinder.goto(new goals.GoalNear(HOPPER_POS.x, HOPPER_POS.y, HOPPER_POS.z, 3));
-    let hopperBlock = bot.blockAt(new Vec3(HOPPER_POS.x, HOPPER_POS.y, HOPPER_POS.z));
-    if (!hopperBlock || hopperBlock.name !== 'hopper') {
-      hopperBlock = bot.findBlock({ matching: (b) => b.name === 'hopper', maxDistance: 8 });
-    }
-    if (!hopperBlock) throw new Error('Hopper not found');
-
-    const hopper = await bot.openContainer(hopperBlock);
-    try {
-      let fails = 0;
-      while (leftovers().length && fails < 20) {
-        const it = leftovers()[0];
-        try {
-          await hopper.deposit(it.type, null, it.count);
-          fails = 0;
-        } catch (e) {
-          fails++;
-        }
-        await sleep(2000);
+    // Deposit remaining unsellable items into hopper patiently
+    const leftovers = () => bot.inventory.items().filter((it) => !isOminousBottle(it) && it.slot !== 36);
+    if (leftovers().length > 0) {
+      setupMovements();
+      await bot.pathfinder.goto(new goals.GoalNear(HOPPER_POS.x, HOPPER_POS.y, HOPPER_POS.z, 3));
+      let hopperBlock = bot.blockAt(new Vec3(HOPPER_POS.x, HOPPER_POS.y, HOPPER_POS.z));
+      if (!hopperBlock || hopperBlock.name !== 'hopper') {
+        hopperBlock = bot.findBlock({ matching: (b) => b.name === 'hopper', maxDistance: 8 });
       }
-    } finally {
-      hopper.close();
+      if (hopperBlock) {
+        const hopper = await bot.openContainer(hopperBlock);
+        try {
+          let fails = 0;
+          while (leftovers().length && fails < 30) {
+            const batch = leftovers().slice(0, 5);
+            for (const it of batch) {
+              try {
+                await hopper.deposit(it.type, null, it.count);
+                await sleep(600 + Math.floor(Math.random() * 300));
+              } catch (e) {
+                fails++;
+              }
+            }
+            await sleep(1000);
+          }
+        } finally {
+          try { hopper.close(); } catch (e) {}
+        }
+      }
     }
+
+    // Pay all money to mcpa
+    say('/pay mcpa *');
+    await sleep(1500);
   }
 
-  // Resumes exact task state seamlessly from memory after recovery/suicide
   async function resumeTaskState() {
     console.log(`[MEMORY] Resuming task state from: ${currentTaskState}`);
     try {
       if (currentTaskState === 'TAKING_POTION' || currentTaskState === 'STARTUP') {
         say('/pw go raidfarm'); await wait(10000);
         equipSword();
-        await takePotionFromChest();
+        await obtainOminousPotion();
         say('/pw go tafarm'); await wait(10000);
         await drinkPotion(); await wait(10000);
         say('/pw go raidfarm'); await wait(10000);
@@ -339,7 +435,6 @@ function startBot() {
       } else if (currentTaskState === 'CLEANUP') {
         await cleanup();
       } else {
-        // Default fallback cycle start
         await raidCycle();
       }
     } catch (e) {
@@ -351,7 +446,7 @@ function startBot() {
     if (!loggedIn) throw new Error('Not logged in');
     say('/pw go raidfarm'); await wait(10000);
     equipSword();
-    await takePotionFromChest();
+    await obtainOminousPotion();
 
     say('/pw go tafarm'); await wait(10000);
     await drinkPotion(); await wait(10000);
@@ -377,14 +472,22 @@ function startBot() {
     }
   }
 
-  // ---------- PROXIMITY WATCHER (10 BLOCKS, EXCLUDE MCPA) ----------
+  // ---------- PROXIMITY WATCHER (50-BLOCK RADIUS OF FARM CENTER ONLY) ----------
   let proximityCheckTimer = null;
   function startProximityWatcher() {
     if (proximityCheckTimer) clearInterval(proximityCheckTimer);
     let hasSaidWhat = false;
 
     proximityCheckTimer = setInterval(async () => {
-      if (!bot || !bot.entity || !loggedIn || ended) return;
+      if (!bot || !bot.entity || !loggedIn || ended || !onSurvivalServer) return;
+
+      const distanceFromFarm = Math.hypot(bot.entity.position.x - FARM_CENTER.x, bot.entity.position.z - FARM_CENTER.z);
+      if (distanceFromFarm > 50) {
+        if (isProximityPaused && !manualStopWork) {
+          isProximityPaused = false;
+        }
+        return;
+      }
 
       const filterPlayer = (p) => {
         if (!p || p.username === bot.username || p.username === 'mcpa') return false;
@@ -397,29 +500,28 @@ function startBot() {
 
       if (targetPlayer) {
         if (!isProximityPaused) {
-          console.log(`[PROXIMITY] Player ${targetPlayer.username} within 10 blocks! Freezing and saying "what".`);
+          console.log(`[PROXIMITY] Player ${targetPlayer.username} within 10 blocks (near farm)! Pausing.`);
           isProximityPaused = true;
           hasSaidWhat = false;
           bot.setControlState('sneak', false);
           if (bot.pathfinder) bot.pathfinder.stop();
         }
 
-        // Head tracking unless stopped by mcpa command
         if (!stopHeadTracking) {
           try {
-            await bot.lookAt(targetPlayer.position.offset(0, targetPlayer.height * 0.8, 0), true);
+            await humanLookAt(targetPlayer.position.offset(0, targetPlayer.height * 0.8, 0), true);
           } catch (e) {}
         }
 
-        // Say "what" once naturally
         if (!hasSaidWhat) {
           hasSaidWhat = true;
+          await sleep(400 + Math.floor(Math.random() * 300));
           say('what');
         }
 
       } else {
         if (isProximityPaused && !manualStopWork) {
-          console.log('[PROXIMITY] Player left radius. Resuming task automatically.');
+          console.log('[PROXIMITY] Player left radius. Resuming task.');
           isProximityPaused = false;
           hasSaidWhat = false;
           stopHeadTracking = false;
@@ -428,13 +530,28 @@ function startBot() {
     }, 1000);
   }
 
+  // ---------- RANDOM CHAT LOOP (EVERY 4 TO 5 MINUTES FROM 100 WORDS) ----------
+  let randomChatTimer = null;
+  function startRandomChatLoop() {
+    if (randomChatTimer) clearTimeout(randomChatTimer);
+    const nextInterval = 240000 + Math.floor(Math.random() * 60000);
+    
+    randomChatTimer = setTimeout(async () => {
+      if (bot && loggedIn && !ended) {
+        const randomWord = RANDOM_CHAT_PHRASES[Math.floor(Math.random() * RANDOM_CHAT_PHRASES.length)];
+        say(randomWord);
+        console.log(`[RANDOM CHAT] Said: "${randomWord}"`);
+      }
+      startRandomChatLoop();
+    }, nextInterval);
+  }
+
   // ---------- HUNGER MONITOR (1 BAR FAILSAFE -> /SUICIDE) ----------
   let hungerCheckTimer = null;
   function startHungerMonitor() {
     if (hungerCheckTimer) clearInterval(hungerCheckTimer);
     hungerCheckTimer = setInterval(async () => {
       if (!bot || !loggedIn || ended) return;
-      // bot.food is 0-20 (1 hunger bar = 2 food points or below)
       if (bot.food <= 2) {
         console.log(`[HUNGER] Hunger dropped to ${bot.food}/20 (1 bar). Executing /suicide failsafe...`);
         sendDiscordAlert('⚠️ Hunger reached 1 bar! Executing /suicide to reset and resume work.');
@@ -444,12 +561,13 @@ function startBot() {
     }, 3000);
   }
 
-  // ---------- EVENTS & IN-GAME PM COMMANDS (/msg mcpa) ----------
+  // ---------- EVENTS & IN-GAME PM COMMANDS ----------
   bot.on('spawn', () => {
     if (started) return;
     started = true;
-    console.log(`Spawned! Version ${version} works.`);
+    console.log(`Spawned securely! Version ${version} works.`);
     startProximityWatcher();
+    startRandomChatLoop();
     startHungerMonitor();
     mainLoop().catch((e) => {
       if (e.message === 'old-bot') return;
@@ -474,7 +592,6 @@ function startBot() {
   });
 
   bot.on('whisper', async (username, message) => {
-    // Only accept commands from mcpa
     if (username !== 'mcpa') return;
     const lower = message.trim().toLowerCase();
     console.log(`[WHISPER FROM MCPA] ${message}`);
@@ -561,7 +678,9 @@ function startBot() {
 
   bot.on('end', (reason) => {
     ended = true;
+    onSurvivalServer = false;
     if (proximityCheckTimer) clearInterval(proximityCheckTimer);
+    if (randomChatTimer) clearTimeout(randomChatTimer);
     if (hungerCheckTimer) clearInterval(hungerCheckTimer);
     if (stopReconnect) return;
     if (started && !gotAnyChat && !process.env.MC_VERSION) {
