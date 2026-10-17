@@ -1,8 +1,14 @@
 {
   "name": "rockyridge-bot",
-  "version": "1.0.1",
-  "description": "Vanilla Mineflayer Survival Bot",
+  "version": "2.0.0",
+  "description": "Mineflayer survival AFK bot with Render keep-alive",
   "main": "bot.js",
+  "scripts": {
+    "start": "node bot.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
   "dependencies": {
     "dotenv": "^16.4.5",
     "mineflayer": "^4.20.0"
